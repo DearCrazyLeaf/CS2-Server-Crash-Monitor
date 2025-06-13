@@ -1,8 +1,9 @@
 param (
     [Parameter(Mandatory=$true)]
     [string]$CS2Path,
-    [Parameter(Mandatory=$true)]
-    [string]$AnimationDllPath
+    
+    [Parameter(Mandatory=$false)]
+    [string]$AnimationDllPath = ""
 )
 
 # Basic setup
@@ -12,15 +13,18 @@ $Host.UI.RawUI.WindowTitle = "CS2 Server Monitor"
 # Normalize paths
 $CS2Path = $CS2Path.Replace('/', '\')
 $CS2Path = [System.IO.Path]::GetFullPath($CS2Path)
-$AnimationDllPath = $AnimationDllPath.Replace('/', '\')
-$AnimationDllPath = [System.IO.Path]::GetFullPath($AnimationDllPath)
+
+if ($AnimationDllPath) {
+    $AnimationDllPath = $AnimationDllPath.Replace('/', '\')
+    $AnimationDllPath = [System.IO.Path]::GetFullPath($AnimationDllPath)
+}
 
 # Global variables
 $script:MonitoringActive = $true
 $script:CrashLogPath = Join-Path (Split-Path $CS2Path -Parent) "crash_logs"
 $script:LastCheckTime = Get-Date
 $script:LastDllHash = $null
-$script:DllMonitoringEnabled = Test-Path $AnimationDllPath
+$script:DllMonitoringEnabled = $AnimationDllPath -and (Test-Path $AnimationDllPath)
 $script:ProcessStartTime = $null
 $script:LastMemoryUsage = 0
 $script:LastCPUTime = $null
