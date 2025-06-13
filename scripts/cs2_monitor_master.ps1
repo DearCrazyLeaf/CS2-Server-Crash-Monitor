@@ -1,3 +1,17 @@
+<#
+.SYNOPSIS
+    CS2 Server Monitor and Auto-Recovery Tool
+.DESCRIPTION
+    Monitors CS2 server process, detects and fixes thread blocks
+    Includes detailed logging and crash reporting
+.AUTHOR
+    DearCrazyLeaf
+.VERSION
+    2.1.0
+.DATE
+    2025-06-13
+#>
+
 param (
     [Parameter(Mandatory=$true)]
     [string]$CS2Path,
@@ -5,6 +19,38 @@ param (
     [Parameter(Mandatory=$false)]
     [string]$AnimationDllPath = ""
 )
+
+# Add required native methods
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class Win32
+{
+    [DllImport("kernel32.dll")]
+    public static extern bool DebugBreakProcess(IntPtr Process);
+    
+    [DllImport("ntdll.dll")]
+    public static extern uint NtAlertThread(IntPtr ThreadHandle);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool IsDebuggerPresent();
+    
+    [DllImport("psapi.dll")]
+    public static extern bool EmptyWorkingSet(IntPtr Process);
+    
+    // 添加辅助方法
+    public static IntPtr GetSafeHandle(object handle)
+    {
+        try {
+            return handle == null ? IntPtr.Zero : new IntPtr(Convert.ToInt64(handle));
+        }
+        catch {
+            return IntPtr.Zero;
+        }
+    }
+}
+"@
 
 # Basic setup
 $ErrorActionPreference = "Stop"
@@ -29,14 +75,50 @@ $script:ProcessStartTime = $null
 $script:LastMemoryUsage = 0
 $script:LastCPUTime = $null
 $script:LastCheckpoint = Get-Date
-
-function Write-Status {
-    param([string]$Message, [string]$Color = "White")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$timestamp] $Message" -ForegroundColor $Color
+$script:ThreadStates = @{}
+$script:LastThreadAction = $null
+$script:Config = @{
+    ThreadMonitoring = @{
+        WarnThreshold = 30              # Warning threshold in seconds
+        ActionThreshold = 120           # Action threshold in seconds
+        MaxRecoveryAttempts = 3        # Maximum recovery attempts per thread
+        MonitorInterval = 5            # Thread monitoring interval in seconds
+    }
+    Performance = @{
+        MaxMemoryMB = 8192            # Maximum memory threshold in MB
+        MaxCPUPercent = 90            # Maximum CPU usage percentage
+        ActionCooldown = 300          # Action cooldown in seconds
+        MemoryTrimInterval = 1800     # Memory trim interval in seconds
+    }
 }
 
-# Get file hash and metadata
+function Write-Status {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO",
+        [string]$Color = "White",
+        [hashtable]$Data = $null
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    # Write to console
+    Write-Host $logMessage -ForegroundColor $Color
+    
+    # If additional data provided, add to crash log
+    if ($Data) {
+        $logEntry = @{
+            Timestamp = $timestamp
+            Level = $Level
+            Message = $Message
+            Data = $Data
+        } | ConvertTo-Json -Depth 10
+        
+        Add-Content -Path (Join-Path $script:CrashLogPath "detailed_log.json") -Value $logEntry
+    }
+}
+
 function Get-FileHashAndMetadata {
     param([string]$FilePath)
     try {
@@ -53,9 +135,52 @@ function Get-FileHashAndMetadata {
     }
 }
 
-# Get process performance metrics
+function Test-DllStatus {
+    if (-not $script:DllMonitoringEnabled) { return $true }
+    
+    try {
+        $currentInfo = Get-FileHashAndMetadata $AnimationDllPath
+        if (-not $currentInfo) { 
+            Write-Status "Failed to get DLL information" "ERROR" "Red" @{
+                Path = $AnimationDllPath
+                Time = Get-Date
+            }
+            return $false 
+        }
+        
+        $changed = $false
+        if ($script:LastDllHash) {
+            $changed = $currentInfo.Hash -ne $script:LastDllHash.Hash -or
+                      $currentInfo.Size -ne $script:LastDllHash.Size
+                      
+            if ($changed) {
+                Write-Status "DLL change detected" "WARNING" "Yellow" @{
+                    OldHash = $script:LastDllHash.Hash
+                    NewHash = $currentInfo.Hash
+                    OldSize = $script:LastDllHash.Size
+                    NewSize = $currentInfo.Size
+                    Time = Get-Date
+                }
+            }
+        }
+        
+        $script:LastDllHash = $currentInfo
+        return -not $changed
+    }
+    catch {
+        Write-Status "Error checking DLL status: $_" "ERROR" "Red" @{
+            ErrorDetails = $_.Exception.Message
+            StackTrace = $_.Exception.StackTrace
+        }
+        return $false
+    }
+}
+
 function Get-ProcessMetrics {
-    param([System.Diagnostics.Process]$Process)
+    param(
+        [System.Diagnostics.Process]$Process,
+        [switch]$Silent = $false
+    )
     
     if (-not $Process) { return $null }
     
@@ -76,33 +201,177 @@ function Get-ProcessMetrics {
     $script:LastMemoryUsage = $workingSet
     $script:LastCheckpoint = Get-Date
     
-    return @{
+    $metrics = @{
         CPU = $cpuUsage
         MemoryMB = [math]::Round($workingSet / 1MB, 2)
         MemoryDiffMB = $memoryDiff
         ThreadCount = $Process.Threads.Count
         HandleCount = $Process.HandleCount
+        DelayedThreads = ($Process.Threads | Where-Object { $_.WaitReason -eq "ExecutionDelay" }).Count
+    }
+    
+    if (-not $Silent) {
+        Write-Status "Performance metrics updated" "DEBUG" "Gray" $metrics
+    }
+    
+    return $metrics
+}
+
+function Update-ThreadMonitoring {
+    param(
+        [System.Diagnostics.Process]$Process
+    )
+    
+    $currentTime = Get-Date
+    $activeThreads = @{}
+    $problemThreads = @()
+    
+    try {
+        $Process.Threads | Where-Object { $_.WaitReason -eq "ExecutionDelay" } | ForEach-Object {
+            $threadId = $_.Id
+            
+            if (-not $script:ThreadStates.ContainsKey($threadId)) {
+                $script:ThreadStates[$threadId] = @{
+                    FirstSeen = $currentTime
+                    DelayCount = 1
+                    LastSeen = $currentTime
+                    RecoveryAttempts = 0
+                    State = "Monitoring"
+                    ThreadDetails = @{
+                        Priority = $_.PriorityLevel
+                        State = $_.ThreadState
+                        WaitReason = $_.WaitReason
+                        StartTime = $_.StartTime
+                    }
+                }
+                
+                Write-Status "New delayed thread detected: $threadId" "THREAD" "Yellow" $script:ThreadStates[$threadId]
+            }
+            else {
+                $threadInfo = $script:ThreadStates[$threadId]
+                $threadInfo.DelayCount++
+                $threadInfo.LastSeen = $currentTime
+                
+                $duration = ($currentTime - $threadInfo.FirstSeen).TotalSeconds
+                if ($duration -gt $script:Config.ThreadMonitoring.WarnThreshold) {
+                    $problemThreads += @{
+                        ThreadId = $threadId
+                        Duration = $duration
+                        DelayCount = $threadInfo.DelayCount
+                        RecoveryAttempts = $threadInfo.RecoveryAttempts
+                    }
+                }
+            }
+            
+            $activeThreads[$threadId] = $true
+        }
+        
+        $threadsToRemove = @()
+        foreach ($threadId in $script:ThreadStates.Keys) {
+            if (-not $activeThreads[$threadId]) {
+                $threadInfo = $script:ThreadStates[$threadId]
+                $timeSinceLastSeen = ($currentTime - $threadInfo.LastSeen).TotalSeconds
+                
+                if ($timeSinceLastSeen -gt $script:Config.ThreadMonitoring.MonitorInterval * 2) {
+                    $threadsToRemove += $threadId
+                    Write-Status "Thread $threadId no longer delayed" "THREAD" "Green" @{
+                        ThreadId = $threadId
+                        FinalState = $threadInfo
+                    }
+                }
+            }
+        }
+        
+        foreach ($threadId in $threadsToRemove) {
+            $script:ThreadStates.Remove($threadId)
+        }
+        
+        return $problemThreads
+    }
+    catch {
+        Write-Status "Error in thread monitoring: $_" "ERROR" "Red" @{
+            ErrorDetails = $_.Exception.Message
+            StackTrace = $_.Exception.StackTrace
+        }
+        return @()
     }
 }
 
-# Monitor DLL status
-function Test-DllStatus {
-    if (-not $script:DllMonitoringEnabled) { return $true }
+function Clear-ThreadBlock {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$ThreadId,
+        [string]$BlockReason
+    )
     
-    $currentInfo = Get-FileHashAndMetadata $AnimationDllPath
-    if (-not $currentInfo) { return $false }
-    
-    $changed = $false
-    if ($script:LastDllHash) {
-        $changed = $currentInfo.Hash -ne $script:LastDllHash.Hash -or
-                  $currentInfo.Size -ne $script:LastDllHash.Size
+    try {
+        Write-Status "Attempting to clear block on thread $ThreadId" "ACTION" "Yellow" @{
+            ThreadId = $ThreadId
+            Reason = $BlockReason
+            CurrentState = $script:ThreadStates[$ThreadId]
+        }
+        
+        $thread = $Process.Threads | Where-Object { $_.Id -eq $ThreadId }
+        if (-not $thread) { return $false }
+        
+        switch ($BlockReason) {
+            "CriticalSection" {
+                # 修改这里：使用安全的方式获取句柄
+                try {
+                    $threadHandle = $thread.Handle
+                    if ($threadHandle) {
+                        [void][Win32]::NtAlertThread([IntPtr]$threadHandle)
+                        Write-Status "Sent alert signal to thread $ThreadId" "ACTION" "Cyan"
+                        return $true
+                    }
+                }
+                catch {
+                    Write-Status "Failed to access thread handle: $_" "ERROR" "Red"
+                    return $false
+                }
+            }
+            "EventPool" {
+                if ($thread.ThreadState -eq "Wait") {
+                    try {
+                        $threadHandle = $thread.Handle
+                        if ($threadHandle) {
+                            [void][Win32]::NtAlertThread([IntPtr]$threadHandle)
+                            Write-Status "Reset event pool for thread $ThreadId" "ACTION" "Cyan"
+                            return $true
+                        }
+                    }
+                    catch {
+                        Write-Status "Failed to access thread handle: $_" "ERROR" "Red"
+                        return $false
+                    }
+                }
+            }
+            "MemoryPressure" {
+                try {
+                    [void][Win32]::EmptyWorkingSet($Process.Handle)
+                    [System.GC]::Collect()
+                    Write-Status "Performed memory optimization" "ACTION" "Cyan"
+                    return $true
+                }
+                catch {
+                    Write-Status "Failed to optimize memory: $_" "ERROR" "Red"
+                    return $false
+                }
+            }
+        }
+    }
+    catch {
+        Write-Status "Error clearing thread block: $_" "ERROR" "Red" @{
+            ThreadId = $ThreadId
+            ErrorDetails = $_.Exception.Message
+            StackTrace = $_.Exception.StackTrace
+        }
+        return $false
     }
     
-    $script:LastDllHash = $currentInfo
-    return -not $changed
+    return $false
 }
 
-# Save crash report
 function Save-CrashReport {
     param(
         [string]$ProcessName = "cs2",
@@ -114,7 +383,6 @@ function Save-CrashReport {
     $crashTime = Get-Date -Format "yyyyMMdd_HHmmss"
     $crashLogFile = Join-Path $script:CrashLogPath "crash_$crashTime.txt"
     
-    # System information
     $systemInfo = @{
         "Crash Time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         "Process Start Time" = $script:ProcessStartTime
@@ -126,28 +394,14 @@ function Save-CrashReport {
                          @{N='FreeGB';E={[math]::Round($_.FreePhysicalMemory/1MB,2)}}
         "CPU Usage" = (Get-WmiObject Win32_Processor).LoadPercentage
     }
-
-    # Process metrics
-    if ($LastMetrics) {
-        $systemInfo["Process Metrics"] = $LastMetrics
+    
+    $threadInfo = @{
+        "Delayed Threads" = $script:ThreadStates
+        "Recent Actions" = ($script:ThreadStates.Values | 
+            Where-Object { $_.RecoveryAttempts -gt 0 } | 
+            Select-Object FirstSeen, DelayCount, RecoveryAttempts)
     }
     
-    # Animation DLL status
-    if ($script:DllMonitoringEnabled -and $script:LastDllHash) {
-        $systemInfo["Animation DLL"] = @{
-            "Hash" = $script:LastDllHash.Hash
-            "Size" = [math]::Round($script:LastDllHash.Size / 1KB, 2)
-            "Last Modified" = $script:LastDllHash.LastWrite
-            "Version" = $script:LastDllHash.Version
-        }
-    }
-    
-    # Recent errors
-    $recentErrors = Get-EventLog -LogName Application -EntryType Error -Newest 20 | 
-        Where-Object { $_.TimeGenerated -gt $script:LastCheckTime } |
-        Select-Object TimeGenerated, Source, Message
-    
-    # Generate report
     @"
 ============================
 CS2 Server Crash Report
@@ -159,11 +413,13 @@ Process Information:
 ------------------
 Start Time: $($systemInfo["Process Start Time"])
 Runtime: $($systemInfo["Process Runtime"])
-Last Known Metrics: $($systemInfo["Process Metrics"] | ConvertTo-Json)
+Last Known Metrics: $($LastMetrics | ConvertTo-Json)
 
-Animation DLL Status:
-------------------
-$($systemInfo["Animation DLL"] | ConvertTo-Json -Depth 10)
+Thread Status:
+------------
+Total Delayed Threads: $($script:ThreadStates.Count)
+Thread Details:
+$($threadInfo | ConvertTo-Json -Depth 10)
 
 System Information:
 ------------------
@@ -171,137 +427,187 @@ Total Memory: $($systemInfo["System Memory"].TotalGB) GB
 Free Memory: $($systemInfo["System Memory"].FreeGB) GB
 CPU Usage: $($systemInfo["CPU Usage"])%
 
-Performance History:
+Animation DLL Status:
 ------------------
-Last CPU Usage: $($LastMetrics.CPU)%
-Memory Usage: $($LastMetrics.MemoryMB) MB
-Memory Change: $($LastMetrics.MemoryDiffMB) MB
-Thread Count: $($LastMetrics.ThreadCount)
-Handle Count: $($LastMetrics.HandleCount)
-
-Recent Application Errors:
-------------------------
-$($recentErrors | ForEach-Object { "$($_.TimeGenerated) - $($_.Source)`n$($_.Message)`n" })
+$($script:LastDllHash | ConvertTo-Json -Depth 5)
 
 Server Information:
 -----------------
 Server Path: $CS2Path
 Animation DLL Path: $AnimationDllPath
 DLL Monitoring: $($script:DllMonitoringEnabled)
+
+Recovery Actions:
+---------------
+Total Recovery Attempts: $($script:ThreadStates.Values | Measure-Object -Property RecoveryAttempts -Sum | Select-Object -ExpandProperty Sum)
+Last Action Time: $($script:LastThreadAction)
 "@ | Out-File -FilePath $crashLogFile -Encoding UTF8
     
-    Write-Status "Crash report saved to: $crashLogFile" "Yellow"
+    Write-Status "Crash report saved to: $crashLogFile" "INFO" "Yellow"
     return $crashLogFile
 }
 
-# Initialize monitoring
-function Initialize-Monitoring {
-    # Create crash logs directory
-    try {
-        if (-not (Test-Path $script:CrashLogPath)) {
-            New-Item -ItemType Directory -Path $script:CrashLogPath -Force | Out-Null
-        }
-        Write-Status "Crash logs will be saved to: $script:CrashLogPath" "Cyan"
-    } catch {
-        throw "Failed to create crash logs directory: $_"
-    }
-
-    # Initialize DLL monitoring
-    if ($script:DllMonitoringEnabled) {
-        $script:LastDllHash = Get-FileHashAndMetadata $AnimationDllPath
-        Write-Status "Animation DLL monitoring enabled" "Green"
-        Write-Status "Initial DLL Hash: $($script:LastDllHash.Hash)" "Cyan"
-    } else {
-        Write-Status "Animation DLL monitoring disabled - DLL not found" "Yellow"
-    }
-}
-
-# Monitor server process
 function Monitor-ServerProcess {
     $processName = "cs2"
     $wasRunning = $false
     $lastProcess = $null
     $lastMetrics = $null
+    $lastThreadCheck = Get-Date
+    $lastMetricsLog = Get-Date
+    $metricsLogInterval = 30
+    
+    Write-Status "Starting server process monitoring..." "INFO" "Cyan"
     
     while ($script:MonitoringActive) {
-        $process = Get-Process $processName -ErrorAction SilentlyContinue
-        
-        if ($process) {
-            if (-not $wasRunning) {
-                $script:ProcessStartTime = $process.StartTime
-                Write-Status "Server process detected - PID: $($process.Id)" "Green"
-                $wasRunning = $true
-            }
+        try {
+            $process = Get-Process $processName -ErrorAction SilentlyContinue
             
-            # Get current metrics
-            $currentMetrics = Get-ProcessMetrics $process
-            
-            # Monitor process health
-            if ($currentMetrics.MemoryMB -gt 8192) { # 8GB warning threshold
-                Write-Status "Warning: High memory usage - $($currentMetrics.MemoryMB) MB" "Yellow"
+            if ($process) {
+                if (-not $wasRunning) {
+                    $script:ProcessStartTime = $process.StartTime
+                    Write-Status "Server process detected - PID: $($process.Id)" "INFO" "Green" @{
+                        ProcessId = $process.Id
+                        StartTime = $process.StartTime
+                        Path = $process.Path
+                    }
+                    $wasRunning = $true
+                }
+                
+                $currentTime = Get-Date
+
+                $currentMetrics = Get-ProcessMetrics $process -Silent
+
+                if (($currentTime - $lastMetricsLog).TotalSeconds -ge $metricsLogInterval) {
+                    $currentMetrics = Get-ProcessMetrics $process
+                    $lastMetricsLog = $currentTime
+
+                    if ($currentMetrics.MemoryMB -gt $script:Config.Performance.MaxMemoryMB) {
+                        Write-Status "High memory usage detected: $($currentMetrics.MemoryMB)MB" "WARNING" "Yellow" @{
+                            CurrentUsage = $currentMetrics.MemoryMB
+                            Threshold = $script:Config.Performance.MaxMemoryMB
+                        }
+                        
+                        if ((-not $script:LastThreadAction) -or 
+                            ($currentTime - $script:LastThreadAction).TotalSeconds -gt $script:Config.Performance.ActionCooldown) {
+                            Clear-ThreadBlock -Process $process -ThreadId 0 -BlockReason "MemoryPressure"
+                            $script:LastThreadAction = $currentTime
+                        }
+                    }
+                }
+                
+                if (($currentTime - $lastThreadCheck).TotalSeconds -ge $script:Config.ThreadMonitoring.MonitorInterval) {
+                    $problemThreads = Update-ThreadMonitoring -Process $process
+                    
+                    foreach ($thread in $problemThreads) {
+                        $severity = if ($thread.Duration -gt $script:Config.ThreadMonitoring.ActionThreshold) {
+                            "WARNING" 
+                        } else { 
+                            "INFO" 
+                        }
+                        
+                        Write-Status "Problem thread $($thread.ThreadId): $($thread.DelayCount) delays, $([Math]::Round($thread.Duration))s duration" $severity "Yellow" @{
+                            ThreadId = $thread.ThreadId
+                            DelayCount = $thread.DelayCount
+                            Duration = $thread.Duration
+                            RecoveryAttempts = $thread.RecoveryAttempts
+                        }
+                        
+                        if ($thread.Duration -gt $script:Config.ThreadMonitoring.ActionThreshold -and 
+                            $thread.RecoveryAttempts -lt $script:Config.ThreadMonitoring.MaxRecoveryAttempts) {
+                            
+                            if ((-not $script:LastThreadAction) -or 
+                                ($currentTime - $script:LastThreadAction).TotalSeconds -gt $script:Config.Performance.ActionCooldown) {
+                                
+                                if (Clear-ThreadBlock -Process $process -ThreadId $thread.ThreadId -BlockReason "EventPool") {
+                                    $script:ThreadStates[$thread.ThreadId].RecoveryAttempts++
+                                    $script:LastThreadAction = $currentTime
+                                }
+                            }
+                        }
+                    }
+                    
+                    $lastThreadCheck = $currentTime
+                }
+                
+                $Host.UI.RawUI.WindowTitle = "CS2 Monitor - PID: $($process.Id) | " + 
+                                           "RAM: $($currentMetrics.MemoryMB)MB | " + 
+                                           "CPU: $($currentMetrics.CPU)% | " + 
+                                           "Delayed Threads: $($currentMetrics.DelayedThreads)"
+                
+                if (-not (Test-DllStatus)) {
+                    Write-Status "Animation DLL changed or corrupted!" "ERROR" "Red"
+                    $crashReport = Save-CrashReport -ProcessName $processName `
+                        -CrashReason "Animation DLL modified" `
+                        -LastProcess $process `
+                        -LastMetrics $currentMetrics
+                }
+                
+                $lastMetrics = $currentMetrics
+                $lastProcess = $process
             }
-            if ($currentMetrics.CPU -gt 90) { # 90% CPU warning threshold
-                Write-Status "Warning: High CPU usage - $($currentMetrics.CPU)%" "Yellow"
+            else {
+                if ($wasRunning) {
+                    Write-Status "Server process stopped!" "ERROR" "Red"
+                    $crashReport = Save-CrashReport -ProcessName $processName `
+                        -CrashReason "Process terminated" `
+                        -LastProcess $lastProcess `
+                        -LastMetrics $lastMetrics
+                    
+                    Write-Status "Crash report generated: $crashReport" "INFO" "Yellow"
+                    
+                    $wasRunning = $false
+                    $script:ProcessStartTime = $null
+                    $script:ThreadStates.Clear()
+                }
+                
+                $Host.UI.RawUI.WindowTitle = "CS2 Monitor - Waiting for server..."
             }
-            
-            # Check animation DLL status
-            if (-not (Test-DllStatus)) {
-                Write-Status "Animation DLL changed or corrupted!" "Red"
-                $crashReport = Save-CrashReport -ProcessName $processName `
-                    -CrashReason "Animation DLL modified" `
-                    -LastProcess $process `
-                    -LastMetrics $currentMetrics
-                Write-Status "Detailed crash report saved: $crashReport" "Yellow"
-            }
-            
-            # Store metrics for crash report
-            $lastMetrics = $currentMetrics
-            $lastProcess = $process
         }
-        else {
-            if ($wasRunning) {
-                Write-Status "Server process stopped or crashed!" "Red"
-                $crashReport = Save-CrashReport -ProcessName $processName `
-                    -CrashReason "Process terminated" `
-                    -LastProcess $lastProcess `
-                    -LastMetrics $lastMetrics
-                Write-Status "Detailed crash report saved: $crashReport" "Yellow"
-                $wasRunning = $false
-                $script:ProcessStartTime = $null
+        catch {
+            Write-Status "Error in monitoring loop: $_" "ERROR" "Red" @{
+                ErrorDetails = $_.Exception.Message
+                StackTrace = $_.Exception.StackTrace
+                LastKnownState = @{
+                    WasRunning = $wasRunning
+                    LastMetrics = $lastMetrics
+                    ThreadStates = $script:ThreadStates
+                }
             }
         }
         
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 1
     }
 }
 
 try {
     Clear-Host
     
-    # Display header
-    Write-Status "================================" "Cyan"
-    Write-Status "    CS2 Server Monitor System    " "Cyan"
-    Write-Status "      By: DearCrazyLeaf         " "Cyan"
-    Write-Status "================================" "Cyan"
+    Write-Status "================================" "INFO" "Cyan"
+    Write-Status "    CS2 Server Monitor v2.1.0    " "INFO" "Cyan"
+    Write-Status "      By: DearCrazyLeaf          " "INFO" "Cyan"
+    Write-Status "================================" "INFO" "Cyan"
     Write-Status ""
     
-    # Initialize monitoring
-    Write-Status "Server Path: $CS2Path" "Yellow"
-    Write-Status "Animation DLL Path: $AnimationDllPath" "Yellow"
-    Write-Status "Initializing..." "Green"
-    Initialize-Monitoring
+    Write-Status "Server Path: $CS2Path" "INFO" "Yellow"
+    Write-Status "Animation DLL Path: $AnimationDllPath" "INFO" "Yellow"
+    Write-Status "Initializing..." "INFO" "Green"
     
-    # Start monitoring
-    Write-Status "Monitor system started" "Green"
-    Write-Status "Press Ctrl+C to exit" "Yellow"
+    if (-not (Test-Path $script:CrashLogPath)) {
+        New-Item -ItemType Directory -Path $script:CrashLogPath -Force | Out-Null
+    }
     
-    # Begin monitoring loop
+    if ($script:DllMonitoringEnabled) {
+        $script:LastDllHash = Get-FileHashAndMetadata $AnimationDllPath
+        Write-Status "Animation DLL monitoring enabled" "INFO" "Green"
+    }
+    
+    Write-Status "Monitor started - Press Ctrl+C to exit" "INFO" "Yellow"
     Monitor-ServerProcess
 }
 catch {
-    Write-Status "Error: $_" "Red"
-    Write-Status "Stack Trace:" "Red"
-    Write-Status $_.ScriptStackTrace "Red"
-    Write-Status "Press any key to continue..." "Yellow"
-    [System.Console]::ReadKey($true) | Out-Null
+    Write-Status "Fatal error: $_" "ERROR" "Red" @{
+        ErrorDetails = $_.Exception.Message
+        StackTrace = $_.Exception.StackTrace
+    }
+    pause
 }
